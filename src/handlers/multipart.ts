@@ -2,7 +2,6 @@ import type { Env, S3Request } from '../types';
 import { MetadataStore } from '../storage/metadata';
 import { uploadToTelegram, RateLimitError, FileTooLargeError, type UploadResult } from '../telegram/upload';
 import { downloadFromTelegram } from '../telegram/download';
-import { TelegramClient } from '../telegram/client';
 import { computeEtag, computeMultipartEtag, sha256Hex } from '../utils/crypto';
 import { extractUserMetadata, extractSystemMetadata, etagMatches } from '../utils/headers';
 import { readBody } from './put-object';
@@ -349,10 +348,21 @@ export async function handleCompleteMultipartUpload(s3: S3Request, env: Env, ctx
   ctx.waitUntil(cleanupParts(dbParts, env));
 
   // Async cleanup: delete old TG message + stale derivatives if destination was overwritten
-  if (oldObj && oldObj.tg_file_id !== '__zero__' && oldObj.tg_file_id !== uploadResult.tgFileId) {
-    const tg = new TelegramClient(env);
-    ctx.waitUntil(tg.deleteMessage(oldObj.tg_chat_id, oldObj.tg_message_id).then(() => {}).catch(() => {}));
-  }
+  if (
+  oldObj &&
+  oldObj.tg_file_id !== '__zero__' &&
+  oldObj.tg_file_id !== uploadResult.tgFileId
+) {
+  ctx.waitUntil(
+    cleanupParts(
+      [{
+        tg_chat_id: oldObj.tg_chat_id,
+        tg_message_id: oldObj.tg_message_id,
+      }],
+      env,
+    )
+  );
+}
   if (oldObj) {
     ctx.waitUntil(deleteDerivatives(upload.bucket, upload.key, env, store));
     ctx.waitUntil(deleteChunks(upload.bucket, upload.key, env, store));
@@ -471,13 +481,63 @@ async function consolidateViaVps(
   return data as unknown as UploadResult;
 }
 
-async function cleanupParts(parts: Array<{ tg_chat_id: string; tg_message_id: number }>, env: Env): Promise<void> {
+async function cleanupParts(
+  parts: Array<{
+    tg_chat_id: string;
+    tg_message_id: number;
+  }>,
+  env: Env,
+): Promise<void> {
+  if (parts.length === 0) return;
+
+  // Local Bot API deployment:
+  // delete temporary messages through the VPS.
+  if (env.VPS_URL) {
+    try {
+      const vps = new VpsClient(env);
+
+      const result =
+        await vps.deleteMessages(
+          parts.map(p => ({
+            chatId: p.tg_chat_id,
+            messageId: p.tg_message_id,
+          })),
+        );
+
+      if (result.failed > 0) {
+        console.warn(
+          `Cleanup: ${result.failed} ` +
+          `of ${parts.length} messages failed`
+        );
+      }
+
+    } catch (e) {
+      console.warn(
+        'Cleanup through VPS failed:',
+        e
+      );
+    }
+
+    return;
+  }
+
+  // Fallback for installations using the public Bot API.
   const tg = new TelegramClient(env);
-  await Promise.allSettled(parts.map(p =>
-    tg.deleteMessage(p.tg_chat_id, p.tg_message_id).catch(e => {
-      console.warn(`Cleanup: failed to delete part message ${p.tg_message_id}:`, e);
-    })
-  ));
+
+  for (const p of parts) {
+    try {
+      await tg.deleteMessage(
+        p.tg_chat_id,
+        p.tg_message_id
+      );
+    } catch (e) {
+      console.warn(
+        `Cleanup: failed to delete ` +
+        `message ${p.tg_message_id}:`,
+        e
+      );
+    }
+  }
 }
 
 function stripQuotes(s: string): string {
