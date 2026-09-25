@@ -1048,95 +1048,603 @@ document.getElementById('fileInput').addEventListener('change', async function()
 });
 
 let uploadCancelled = false;
+let activeUploadXhr = null;
+
+// Files larger than this use S3 Multipart Upload.
+const MULTIPART_THRESHOLD = 64 * 1024 * 1024;
+
+// Each part is 16 MiB.
+// S3 requires every non-final part to be at least 5 MiB.
+const MULTIPART_PART_SIZE = 16 * 1024 * 1024;
+
+function cancelCurrentUpload() {
+  uploadCancelled = true;
+
+  if (activeUploadXhr) {
+    try {
+      activeUploadXhr.abort();
+    } catch (_e) {}
+  }
+
+  var btn = document.getElementById('uploadCancelBtn');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = t('cancelling');
+  }
+}
+
+function s3ObjectUrl(bucket, key) {
+  var encodedBucket = encodeURIComponent(bucket);
+
+  // Encode every path segment separately so folders continue to work.
+  var encodedKey = key
+    .split('/')
+    .map(function(part) {
+      return encodeURIComponent(part);
+    })
+    .join('/');
+
+  return API + '/' + encodedBucket + '/' + encodedKey;
+}
+
+async function getResponseError(res) {
+  var text = '';
+
+  try {
+    text = await res.text();
+  } catch (_e) {}
+
+  if (!text) {
+    return 'HTTP ' + res.status;
+  }
+
+  // JSON error
+  try {
+    var json = JSON.parse(text);
+    if (json && json.error) {
+      return json.error;
+    }
+  } catch (_e) {}
+
+  // S3 XML error
+  var match = text.match(/<Message>([\s\S]*?)<\/Message>/i);
+  if (match) {
+    return match[1];
+  }
+
+  return 'HTTP ' + res.status;
+}
+
+function uploadPartWithProgress(url, blob, onProgress) {
+  return new Promise(function(resolve, reject) {
+    var xhr = new XMLHttpRequest();
+    activeUploadXhr = xhr;
+
+    xhr.open('PUT', url);
+    xhr.setRequestHeader('Authorization', authHeader);
+    xhr.setRequestHeader(
+      'Content-Type',
+      'application/octet-stream'
+    );
+
+    xhr.upload.onprogress = function(ev) {
+      if (ev.lengthComputable && onProgress) {
+        onProgress(ev.loaded, ev.total);
+      }
+    };
+
+    xhr.onload = function() {
+      activeUploadXhr = null;
+
+      if (xhr.status >= 200 && xhr.status < 300) {
+        var etag = xhr.getResponseHeader('ETag');
+
+        if (!etag) {
+          reject(new Error('UploadPart succeeded but ETag is missing'));
+          return;
+        }
+
+        resolve(etag);
+        return;
+      }
+
+      var serverMsg = '';
+
+      try {
+        var rt = xhr.responseText || '';
+
+        if (rt.charAt(0) === '{') {
+          serverMsg = JSON.parse(rt).error || '';
+        } else {
+          var a = rt.indexOf('<Message>');
+          var b = rt.indexOf('</Message>');
+
+          if (a >= 0 && b > a) {
+            serverMsg = rt.slice(a + 9, b);
+          }
+        }
+      } catch (_e) {}
+
+      reject(
+        new Error(
+          serverMsg
+            ? 'UploadPart failed (' + xhr.status + '): ' + serverMsg
+            : 'UploadPart failed (' + xhr.status + ')'
+        )
+      );
+    };
+
+    xhr.onerror = function() {
+      activeUploadXhr = null;
+      reject(new Error('Network error'));
+    };
+
+    xhr.ontimeout = function() {
+      activeUploadXhr = null;
+      reject(new Error('Timeout'));
+    };
+
+    xhr.onabort = function() {
+      activeUploadXhr = null;
+      reject(new Error('Upload cancelled'));
+    };
+
+    // 10 minutes per 16 MiB part.
+    xhr.timeout = 10 * 60 * 1000;
+
+    xhr.send(blob);
+  });
+}
+
+async function abortMultipartUpload(baseUrl, uploadId) {
+  if (!uploadId) return;
+
+  try {
+    await fetch(
+      baseUrl + '?uploadId=' + encodeURIComponent(uploadId),
+      {
+        method: 'DELETE',
+        headers: {
+          'Authorization': authHeader
+        }
+      }
+    );
+  } catch (_e) {
+    // Best effort cleanup.
+  }
+}
+
+async function multipartUploadFile(file, key, onProgress) {
+  var baseUrl = s3ObjectUrl(currentBucket, key);
+  var uploadId = '';
+  var uploadedParts = [];
+
+  try {
+    // ------------------------------------------------------------
+    // 1. CreateMultipartUpload
+    // ------------------------------------------------------------
+    var initRes = await fetch(baseUrl + '?uploads', {
+      method: 'POST',
+      headers: {
+        'Authorization': authHeader,
+        'Content-Type': file.type || 'application/octet-stream'
+      }
+    });
+
+    if (!initRes.ok) {
+      throw new Error(
+        'CreateMultipartUpload failed: ' +
+        await getResponseError(initRes)
+      );
+    }
+
+    var initXml = await initRes.text();
+
+    var uploadIdMatch =
+      initXml.match(/<UploadId>([^<]+)<\/UploadId>/i);
+
+    if (!uploadIdMatch) {
+      throw new Error('CreateMultipartUpload returned no UploadId');
+    }
+
+    uploadId = uploadIdMatch[1];
+
+    // ------------------------------------------------------------
+    // 2. UploadPart
+    // ------------------------------------------------------------
+    var partCount =
+      Math.ceil(file.size / MULTIPART_PART_SIZE);
+
+    for (var partNumber = 1;
+         partNumber <= partCount;
+         partNumber++) {
+
+      if (uploadCancelled) {
+        throw new Error('Upload cancelled');
+      }
+
+      var start =
+        (partNumber - 1) * MULTIPART_PART_SIZE;
+
+      var end = Math.min(
+        start + MULTIPART_PART_SIZE,
+        file.size
+      );
+
+      var blob = file.slice(start, end);
+
+      var partUrl =
+        baseUrl +
+        '?partNumber=' + partNumber +
+        '&uploadId=' + encodeURIComponent(uploadId);
+
+      var etag = await uploadPartWithProgress(
+        partUrl,
+        blob,
+        function(partLoaded) {
+          if (onProgress) {
+            onProgress(start + partLoaded);
+          }
+        }
+      );
+
+      uploadedParts.push({
+        partNumber: partNumber,
+        etag: etag
+      });
+    }
+
+    if (uploadCancelled) {
+      throw new Error('Upload cancelled');
+    }
+
+    // ------------------------------------------------------------
+    // 3. CompleteMultipartUpload
+    // ------------------------------------------------------------
+    var completeXml =
+      '<?xml version="1.0" encoding="UTF-8"?>' +
+      '<CompleteMultipartUpload>' +
+      uploadedParts.map(function(part) {
+        return (
+          '<Part>' +
+            '<PartNumber>' +
+              part.partNumber +
+            '</PartNumber>' +
+            '<ETag>' +
+              part.etag +
+            '</ETag>' +
+          '</Part>'
+        );
+      }).join('') +
+      '</CompleteMultipartUpload>';
+
+    var completeRes = await fetch(
+      baseUrl +
+      '?uploadId=' +
+      encodeURIComponent(uploadId),
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': authHeader,
+          'Content-Type': 'application/xml'
+        },
+        body: completeXml
+      }
+    );
+
+    if (!completeRes.ok) {
+      throw new Error(
+        'CompleteMultipartUpload failed: ' +
+        await getResponseError(completeRes)
+      );
+    }
+
+    if (onProgress) {
+      onProgress(file.size);
+    }
+
+  } catch (e) {
+    // If any part fails or the user cancels,
+    // tell the Worker to abandon the multipart upload.
+    await abortMultipartUpload(baseUrl, uploadId);
+    throw e;
+  }
+}
+
+function normalUploadFile(file, key, onProgress) {
+  return new Promise(function(resolve, reject) {
+    var xhr = new XMLHttpRequest();
+    activeUploadXhr = xhr;
+
+    xhr.open(
+      'PUT',
+      API +
+      '/api/miniapp/upload?bucket=' +
+      encodeURIComponent(currentBucket) +
+      '&key=' +
+      encodeURIComponent(key)
+    );
+
+    xhr.setRequestHeader(
+      'Authorization',
+      authHeader
+    );
+
+    xhr.setRequestHeader(
+      'Content-Type',
+      file.type || 'application/octet-stream'
+    );
+
+    xhr.upload.onprogress = function(ev) {
+      if (ev.lengthComputable && onProgress) {
+        onProgress(ev.loaded);
+      }
+    };
+
+    xhr.onload = function() {
+      activeUploadXhr = null;
+
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve();
+        return;
+      }
+
+      var serverMsg = '';
+
+      try {
+        var rt = xhr.responseText || '';
+
+        if (rt.charAt(0) === '{') {
+          serverMsg = JSON.parse(rt).error || '';
+        } else {
+          var a = rt.indexOf('<Message>');
+          var b = rt.indexOf('</Message>');
+
+          if (a >= 0 && b > a) {
+            serverMsg = rt.slice(a + 9, b);
+          }
+        }
+      } catch (_e) {}
+
+      reject(
+        new Error(
+          serverMsg
+            ? t('upload_put_failed', xhr.status) +
+              ': ' + serverMsg
+            : t('upload_put_failed', xhr.status)
+        )
+      );
+    };
+
+    xhr.onerror = function() {
+      activeUploadXhr = null;
+      reject(new Error('Network error'));
+    };
+
+    xhr.ontimeout = function() {
+      activeUploadXhr = null;
+      reject(new Error('Timeout'));
+    };
+
+    xhr.onabort = function() {
+      activeUploadXhr = null;
+      reject(new Error('Upload cancelled'));
+    };
+
+    xhr.timeout = 10 * 60 * 1000;
+
+    xhr.send(file);
+  });
+}
 
 async function uploadFiles(files) {
   const total = files.length;
   let done = 0;
   const failedFiles = [];
+
   uploadCancelled = false;
+  activeUploadXhr = null;
+
   var totalBytes = 0;
-  for (var fi = 0; fi < files.length; fi++) totalBytes += files[fi].size;
+
+  for (var fi = 0; fi < files.length; fi++) {
+    totalBytes += files[fi].size;
+  }
+
   var uploadedBytes = 0;
 
   showModal(\`
     <h3>\${esc(t('uploading_title'))}</h3>
-    <div id="uploadStatus" style="margin:12px 0">\${esc(t('preparing_upload', total))}</div>
-    <div class="progress-bar"><div class="progress-bar-fill" id="uploadProgress" style="width:0%"></div></div>
-    <div id="uploadDetail" style="font-size:12px;color:var(--hint)"></div>
-    <div style="text-align:center;margin-top:12px"><button class="btn btn-sm btn-outline" id="uploadCancelBtn" onclick="uploadCancelled=true;this.disabled=true;this.textContent=t('cancelling')">\${esc(t('cancel'))}</button></div>
+
+    <div id="uploadStatus" style="margin:12px 0">
+      \${esc(t('preparing_upload', total))}
+    </div>
+
+    <div class="progress-bar">
+      <div
+        class="progress-bar-fill"
+        id="uploadProgress"
+        style="width:0%">
+      </div>
+    </div>
+
+    <div
+      id="uploadDetail"
+      style="font-size:12px;color:var(--hint)">
+    </div>
+
+    <div style="text-align:center;margin-top:12px">
+      <button
+        class="btn btn-sm btn-outline"
+        id="uploadCancelBtn"
+        onclick="cancelCurrentUpload()">
+        \${esc(t('cancel'))}
+      </button>
+    </div>
   \`);
 
   for (let i = 0; i < files.length; i++) {
     if (uploadCancelled) break;
+
     const file = files[i];
     const key = currentPrefix + file.name;
-    const detail = document.getElementById('uploadDetail');
-    const status = document.getElementById('uploadStatus');
-    const progress = document.getElementById('uploadProgress');
-    if (detail) detail.textContent = t('uploading_file', file.name, formatSize(file.size));
-    if (status) status.textContent = t('uploading_progress', i + 1, total);
 
-    if (file.size > 20 * 1024 * 1024) {
-      toast(t('large_file_warning'));
+    const detail =
+      document.getElementById('uploadDetail');
+
+    const status =
+      document.getElementById('uploadStatus');
+
+    const progress =
+      document.getElementById('uploadProgress');
+
+    if (status) {
+      status.textContent =
+        t('uploading_progress', i + 1, total);
+    }
+
+    var fileBaseBytes = uploadedBytes;
+
+    function updateFileProgress(fileLoaded) {
+      var overallLoaded =
+        fileBaseBytes + fileLoaded;
+
+      var overallPct =
+        totalBytes > 0
+          ? Math.round(
+              overallLoaded /
+              totalBytes *
+              100
+            )
+          : 0;
+
+      if (progress) {
+        progress.style.width =
+          overallPct + '%';
+      }
+
+      if (detail) {
+        detail.textContent =
+          t(
+            'uploading_file',
+            file.name,
+            formatSize(fileLoaded) +
+            ' / ' +
+            formatSize(file.size)
+          );
+      }
     }
 
     try {
-      await new Promise(function(resolve, reject) {
-        var xhr = new XMLHttpRequest();
-        xhr.open('PUT', API + '/api/miniapp/upload?bucket=' + encodeURIComponent(currentBucket) + '&key=' + encodeURIComponent(key));
-        xhr.setRequestHeader('Authorization', authHeader);
-        xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
-        xhr.upload.onprogress = function(ev) {
-          if (ev.lengthComputable && progress) {
-            var filePct = ev.loaded / ev.total;
-            var overallPct = totalBytes > 0
-              ? Math.round(((uploadedBytes + ev.loaded) / totalBytes) * 100)
-              : Math.round(((i + filePct) / total) * 100);
-            progress.style.width = overallPct + '%';
-            if (detail) detail.textContent = t('uploading_file', file.name, formatSize(ev.loaded) + ' / ' + formatSize(ev.total));
-          }
-        };
-        xhr.onload = function() {
-          if (xhr.status >= 200 && xhr.status < 300) { resolve(); return; }
-          // Surface the underlying server/Telegram error instead of just the status code
-          var serverMsg = '';
-          try {
-            var rt = xhr.responseText || '';
-            if (rt.charAt(0) === '{') serverMsg = JSON.parse(rt).error || '';
-            else {
-              var a = rt.indexOf('<Message>'), b = rt.indexOf('</Message>');
-              if (a >= 0 && b > a) serverMsg = rt.slice(a + 9, b);
-            }
-          } catch (_e) {}
-          reject(new Error(serverMsg ? t('upload_put_failed', xhr.status) + ': ' + serverMsg : t('upload_put_failed', xhr.status)));
-        };
-        xhr.onerror = function() { reject(new Error('Network error')); };
-        xhr.ontimeout = function() { reject(new Error('Timeout')); };
-        xhr.timeout = 300000; // 5 min
-        xhr.send(file);
-      });
+      if (file.size > MULTIPART_THRESHOLD) {
+
+        if (detail) {
+          detail.textContent =
+            '分片上传：' +
+            file.name +
+            '（每片 ' +
+            formatSize(MULTIPART_PART_SIZE) +
+            '）';
+        }
+
+        await multipartUploadFile(
+          file,
+          key,
+          updateFileProgress
+        );
+
+      } else {
+
+        await normalUploadFile(
+          file,
+          key,
+          updateFileProgress
+        );
+
+      }
+
       done++;
+
     } catch (e) {
-      var reason = e && e.message ? e.message : '';
-      failedFiles.push(reason ? file.name + ' (' + reason + ')' : file.name);
+      var reason =
+        e && e.message
+          ? e.message
+          : '';
+
+      failedFiles.push(
+        reason
+          ? file.name + ' (' + reason + ')'
+          : file.name
+      );
     }
 
     uploadedBytes += file.size;
-    var pct = totalBytes > 0 ? Math.round((uploadedBytes / totalBytes) * 100) : Math.round(((i + 1) / total) * 100);
-    if (progress) progress.style.width = pct + '%';
+
+    var pct =
+      totalBytes > 0
+        ? Math.round(
+            uploadedBytes /
+            totalBytes *
+            100
+          )
+        : Math.round(
+            ((i + 1) / total) * 100
+          );
+
+    if (progress) {
+      progress.style.width =
+        pct + '%';
+    }
   }
 
+  activeUploadXhr = null;
+
   closeModal();
+
   if (uploadCancelled) {
-    toast(t('upload_cancelled', done, total));
+
+    toast(
+      t(
+        'upload_cancelled',
+        done,
+        total
+      )
+    );
+
   } else if (failedFiles.length > 0) {
-    const summary = failedFiles.length <= 3
-      ? failedFiles.join(', ')
-      : failedFiles.slice(0, 3).join(', ') + t('and_more', failedFiles.length);
-    toast(t('upload_done_fail', done, total, summary));
+
+    const summary =
+      failedFiles.length <= 3
+        ? failedFiles.join(', ')
+        : failedFiles
+            .slice(0, 3)
+            .join(', ') +
+          t(
+            'and_more',
+            failedFiles.length
+          );
+
+    toast(
+      t(
+        'upload_done_fail',
+        done,
+        total,
+        summary
+      )
+    );
+
   } else {
-    toast(t('upload_done', done, total));
+
+    toast(
+      t(
+        'upload_done',
+        done,
+        total
+      )
+    );
+
   }
+
   loadFiles();
   loadStats();
 }
