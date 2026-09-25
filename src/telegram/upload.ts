@@ -27,13 +27,13 @@ export async function uploadToTelegram(
     throw new FileTooLargeError(size, maxSize, limitStr);
   }
 
-  // <=20MB: Worker directly via Bot API
-  if (size <= BOT_API_GETFILE_LIMIT) {
-    return uploadDirect(data, chatId, filename, contentType, env, messageThreadId);
-  }
-
-  // 20MB - 2GB: VPS single file upload via Local Bot API
+  // When VPS is configured, always use the Local Bot API through VPS.
+if (env.VPS_URL) {
   return uploadViaVps(data, chatId, filename, contentType, env, messageThreadId);
+}
+
+// Fallback to public Bot API only when no VPS is configured.
+return uploadDirect(data, chatId, filename, contentType, env, messageThreadId);
 }
 
 async function uploadDirect(
