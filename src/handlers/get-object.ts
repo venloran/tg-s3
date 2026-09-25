@@ -234,12 +234,16 @@ export async function handleGetObject(s3: S3Request, env: Env, ctx?: ExecutionCo
   }
 
   // >20MB: must go through VPS proxy (Bot API getFile can't handle it)
-  if (obj.size > MAX_DIRECT_DOWNLOAD) {
-    if (!env.VPS_URL) {
-      return errorResponse(503, 'ServiceUnavailable', 'File exceeds 20MB and requires VPS proxy which is not configured.');
-    }
-    return downloadViaVps(obj, headers, rangeHeader, env, objEncrypted ? sseParams : null, objEncryptedS3);
-  }
+  if (env.VPS_URL) {
+  return downloadViaVps(
+    obj,
+    headers,
+    rangeHeader,
+    env,
+    objEncrypted ? sseParams : null,
+    objEncryptedS3
+  );
+}
 
   // Check range satisfiability before downloading
   const range = rangeHeader ? parseRange(rangeHeader, obj.size) : null;
