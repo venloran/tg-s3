@@ -213,6 +213,56 @@ export class VpsClient {
     });
   }
 
+async deleteMessages(
+  messages: Array<{
+    chatId: string;
+    messageId: number;
+  }>,
+): Promise<{
+  ok: boolean;
+  deleted: number;
+  failed: number;
+}> {
+  if (messages.length === 0) {
+    return {
+      ok: true,
+      deleted: 0,
+      failed: 0,
+    };
+  }
+
+  return this.withRetry(async () => {
+    const res = await fetch(
+      `${this.baseUrl}/api/proxy/delete-messages`,
+      {
+        method: 'POST',
+        headers: this.headers(),
+        body: JSON.stringify({
+          messages: messages.map(m => ({
+            chat_id: m.chatId,
+            message_id: m.messageId,
+          })),
+        }),
+        signal:
+          AbortSignal.timeout(
+            VPS_LONG_TIMEOUT
+          ),
+      },
+    );
+
+    if (!res.ok) {
+      const text = await res.text();
+
+      throw new Error(
+        `VPS delete messages failed ` +
+        `(${res.status}): ${text}`
+      );
+    }
+
+    return res.json();
+  });
+}
+  
   async consolidate(
     fileIds: string[], chatId: string, filename: string, contentType: string,
     messageThreadId?: number | null,
