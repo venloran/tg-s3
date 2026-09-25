@@ -1117,13 +1117,23 @@ if (a >= 0 && b > a) {
   return 'HTTP ' + res.status;
 }
 
-function uploadPartWithProgress(url, blob, onProgress) {
+function uploadPartOnce(
+  url,
+  blob,
+  onProgress,
+  partNumber
+) {
   return new Promise(function(resolve, reject) {
     var xhr = new XMLHttpRequest();
     activeUploadXhr = xhr;
 
     xhr.open('PUT', url);
-    xhr.setRequestHeader('Authorization', authHeader);
+
+    xhr.setRequestHeader(
+      'Authorization',
+      authHeader
+    );
+
     xhr.setRequestHeader(
       'Content-Type',
       'application/octet-stream'
@@ -1138,11 +1148,23 @@ function uploadPartWithProgress(url, blob, onProgress) {
     xhr.onload = function() {
       activeUploadXhr = null;
 
-      if (xhr.status >= 200 && xhr.status < 300) {
-        var etag = xhr.getResponseHeader('ETag');
+      if (
+        xhr.status >= 200 &&
+        xhr.status < 300
+      ) {
+        var etag =
+          xhr.getResponseHeader('ETag');
 
         if (!etag) {
-          reject(new Error('UploadPart succeeded but ETag is missing'));
+          var err =
+            new Error(
+              'Part ' +
+              partNumber +
+              ': ETag missing'
+            );
+
+          err.retryable = true;
+          reject(err);
           return;
         }
 
@@ -1156,46 +1178,153 @@ function uploadPartWithProgress(url, blob, onProgress) {
         var rt = xhr.responseText || '';
 
         if (rt.charAt(0) === '{') {
-          serverMsg = JSON.parse(rt).error || '';
+          serverMsg =
+            JSON.parse(rt).error || '';
         } else {
-          var a = rt.indexOf('<Message>');
-          var b = rt.indexOf('</Message>');
+          var a =
+            rt.indexOf('<Message>');
+
+          var b =
+            rt.indexOf('</Message>');
 
           if (a >= 0 && b > a) {
-            serverMsg = rt.slice(a + 9, b);
+            serverMsg =
+              rt.slice(a + 9, b);
           }
         }
       } catch (_e) {}
 
-      reject(
+      var err =
         new Error(
-          serverMsg
-            ? 'UploadPart failed (' + xhr.status + '): ' + serverMsg
-            : 'UploadPart failed (' + xhr.status + ')'
-        )
-      );
+          'Part ' +
+          partNumber +
+          ' HTTP ' +
+          xhr.status +
+          (
+            serverMsg
+              ? ': ' + serverMsg
+              : ''
+          )
+        );
+
+      err.status = xhr.status;
+
+      err.retryable =
+        xhr.status === 429 ||
+        xhr.status >= 500;
+
+      reject(err);
     };
 
     xhr.onerror = function() {
       activeUploadXhr = null;
-      reject(new Error('Network error'));
+
+      var err =
+        new Error(
+          'Part ' +
+          partNumber +
+          ': Network error'
+        );
+
+      err.retryable = true;
+      reject(err);
     };
 
     xhr.ontimeout = function() {
       activeUploadXhr = null;
-      reject(new Error('Timeout'));
+
+      var err =
+        new Error(
+          'Part ' +
+          partNumber +
+          ': Timeout'
+        );
+
+      err.retryable = true;
+      reject(err);
     };
 
     xhr.onabort = function() {
       activeUploadXhr = null;
-      reject(new Error('Upload cancelled'));
+
+      reject(
+        new Error('Upload cancelled')
+      );
     };
 
-    // 10 minutes per 16 MiB part.
-    xhr.timeout = 10 * 60 * 1000;
+    xhr.timeout =
+      10 * 60 * 1000;
 
     xhr.send(blob);
   });
+}
+
+async function uploadPartWithProgress(
+  url,
+  blob,
+  onProgress,
+  partNumber
+) {
+  const MAX_RETRIES = 3;
+
+  for (
+    let attempt = 0;
+    attempt <= MAX_RETRIES;
+    attempt++
+  ) {
+    if (uploadCancelled) {
+      throw new Error('Upload cancelled');
+    }
+
+    try {
+      return await uploadPartOnce(
+        url,
+        blob,
+        onProgress,
+        partNumber
+      );
+
+    } catch (e) {
+
+      if (uploadCancelled) {
+        throw e;
+      }
+
+      var retryable =
+        e && e.retryable === true;
+
+      if (
+        !retryable ||
+        attempt >= MAX_RETRIES
+      ) {
+        throw e;
+      }
+
+      // 2s → 4s → 8s
+      var delay =
+        2000 * Math.pow(2, attempt);
+
+      var detail =
+        document.getElementById(
+          'uploadDetail'
+        );
+
+      if (detail) {
+        detail.textContent =
+          '分片 ' +
+          partNumber +
+          ' 上传失败，' +
+          Math.round(delay / 1000) +
+          ' 秒后自动重试（' +
+          (attempt + 1) +
+          '/3）…';
+      }
+
+      await new Promise(function(resolve) {
+        setTimeout(resolve, delay);
+      });
+    }
+  }
 }
 
 async function abortMultipartUpload(baseUrl, uploadId) {
@@ -1287,7 +1416,8 @@ async function multipartUploadFile(file, key, onProgress) {
           if (onProgress) {
             onProgress(start + partLoaded);
           }
-        }
+        },
+        partNumber
       );
 
       uploadedParts.push({
@@ -1299,6 +1429,18 @@ async function multipartUploadFile(file, key, onProgress) {
     if (uploadCancelled) {
       throw new Error('Upload cancelled');
     }
+
+if (onProgress) {
+  onProgress(file.size);
+}
+
+var detail =
+  document.getElementById('uploadDetail');
+
+if (detail) {
+  detail.textContent =
+    '所有分片上传完成，正在 VPS 合并文件并上传最终文件到 Telegram，请勿关闭窗口…';
+}
 
     // ------------------------------------------------------------
     // 3. CompleteMultipartUpload
@@ -1339,10 +1481,6 @@ async function multipartUploadFile(file, key, onProgress) {
         'CompleteMultipartUpload failed: ' +
         await getResponseError(completeRes)
       );
-    }
-
-    if (onProgress) {
-      onProgress(file.size);
     }
 
   } catch (e) {
