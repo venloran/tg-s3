@@ -1107,10 +1107,12 @@ async function getResponseError(res) {
   } catch (_e) {}
 
   // S3 XML error
-  var match = text.match(/<Message>([\s\S]*?)<\/Message>/i);
-  if (match) {
-    return match[1];
-  }
+  var a = text.indexOf('<Message>');
+var b = text.indexOf('</Message>');
+
+if (a >= 0 && b > a) {
+  return text.slice(a + 9, b);
+}
 
   return 'HTTP ' + res.status;
 }
@@ -1240,14 +1242,14 @@ async function multipartUploadFile(file, key, onProgress) {
 
     var initXml = await initRes.text();
 
-    var uploadIdMatch =
-      initXml.match(/<UploadId>([^<]+)<\/UploadId>/i);
+    var uploadIdStart = initXml.indexOf('<UploadId>');
+    var uploadIdEnd = initXml.indexOf('</UploadId>');
 
-    if (!uploadIdMatch) {
+    if (uploadIdStart < 0 || uploadIdEnd <= uploadIdStart) {
       throw new Error('CreateMultipartUpload returned no UploadId');
     }
 
-    uploadId = uploadIdMatch[1];
+    uploadId = initXml.slice(uploadIdStart + 10, uploadIdEnd);
 
     // ------------------------------------------------------------
     // 2. UploadPart
