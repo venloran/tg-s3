@@ -1,7 +1,7 @@
 import express from 'express';
 import { createReadStream, createWriteStream, unlinkSync, existsSync, mkdirSync } from 'fs';
 import { readFile, writeFile, unlink, stat, open as openFile } from 'fs/promises';
-import { createDecipheriv, createCipheriv, randomUUID, randomBytes, createHash } from 'crypto';
+import { createDecipheriv, createCipheriv, randomUUID, randomBytes, createHash, timingSafeEqual } from 'crypto';
 import { join } from 'path';
 import { pipeline } from 'stream/promises';
 import { execFile } from 'child_process';
@@ -35,7 +35,7 @@ function authMiddleware(req, res, next) {
   if (!auth) return res.status(401).json({ error: 'Unauthorized' });
   const expected = `Bearer ${AUTH_SECRET}`;
   if (auth.length !== expected.length ||
-      !require('crypto').timingSafeEqual(Buffer.from(auth), Buffer.from(expected))) {
+      !timingSafeEqual(Buffer.from(auth), Buffer.from(expected))) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   next();
