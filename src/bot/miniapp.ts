@@ -1055,7 +1055,7 @@ const MULTIPART_THRESHOLD = 64 * 1024 * 1024;
 
 // Each part is 16 MiB.
 // S3 requires every non-final part to be at least 5 MiB.
-const MULTIPART_PART_SIZE = 16 * 1024 * 1024;
+const MULTIPART_PART_SIZE = 8 * 1024 * 1024;
 
 function cancelCurrentUpload() {
   uploadCancelled = true;
@@ -1265,7 +1265,7 @@ async function uploadPartWithProgress(
   onProgress,
   partNumber
 ) {
-  const MAX_RETRIES = 3;
+  const MAX_RETRIES = 5;
 
   for (
     let attempt = 0;
@@ -1423,6 +1423,12 @@ async function multipartUploadFile(file, key, onProgress) {
       uploadedParts.push({
         partNumber: partNumber,
         etag: etag
+      });
+    }
+
+    if (partNumber < partCount) {
+      await new Promise(function(resolve) {
+        setTimeout(resolve, 1000);
       });
     }
 
